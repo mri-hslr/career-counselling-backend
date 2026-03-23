@@ -1,4 +1,5 @@
 import os
+import logging
 from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel, Field
 from typing import List
@@ -11,6 +12,10 @@ from langchain_core.output_parsers import PydanticOutputParser
 
 # Import the lazy-loaded vector store from main
 from main import get_vector_store
+
+# --- Setup Logging ---
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+logger = logging.getLogger(__name__)
 
 # Initialize the router
 router = APIRouter(prefix="/api/v1", tags=["Lesson Plan Generation"])
@@ -32,9 +37,10 @@ class CaseBasedQuestion(BaseModel):
 
 class LessonPlanOutput(BaseModel):
     chapter_summary: str = Field(description="A 3-4 sentence summary of the chapter")
-    mcqs: List[MCQ] = Field(description="A list of multiple choice questions")
-    short_answers: List[ShortAnswer] = Field(description="A list of short answer questions")
-    case_based_questions: List[CaseBasedQuestion] = Field(description="A list of case-based analytical questions")
+    # Added default_factory=list so Pydantic doesn't crash if the LLM generates 0 questions
+    mcqs: List[MCQ] = Field(default_factory=list, description="A list of multiple choice questions")
+    short_answers: List[ShortAnswer] = Field(default_factory=list, description="A list of short answer questions")
+    case_based_questions: List[CaseBasedQuestion] = Field(default_factory=list, description="A list of case-based analytical questions")
 
 # --- Endpoints ---
 @router.post("/generate_lesson_plan", response_model=LessonPlanOutput)
@@ -48,32 +54,42 @@ async def generate_lesson_plan(
     vs: PGVector = Depends(get_vector_store) # Injects the lazy-loaded vector store
 ):
     """ Retrieves context from Postgres and generates a structured lesson plan dynamically. """
-    
+    logger.info(f"Generating lesson plan for Class: {class_name}, Subject: {subject}, Chapter: {chapter_name}")
+    logger.info(f"Requested counts -> MCQs: {num_mcqs}, Short Answers: {num_short_answers}, Case-Based: {num_case_based}")
+
     # 1. Vector Search (RAG)
-    retriever = vs.as_retriever(
-        search_kwargs={
-            "k": 25, 
-            "filter": {
-                "class_name": class_name,
-                "subject": subject,
-                "chapter_name": chapter_name
+    try:
+        retriever = vs.as_retriever(
+            search_kwargs={
+                "k": 25, 
+                "filter": {
+                    "class_name": class_name,
+                    "subject": subject,
+                    "chapter_name": chapter_name
+                }
             }
-        }
-    )
+        )
 
-    docs = retriever.invoke(f"Extract key concepts for {chapter_name}")
-    context_text = "\n\n".join([doc.page_content for doc in docs])
+        docs = retriever.invoke(f"Extract key concepts for {chapter_name}")
+        context_text = "\n\n".join([doc.page_content for doc in docs])
 
-    if not context_text:
-        raise HTTPException(status_code=404, detail="No ingested data found for this class and chapter.")
+        if not context_text:
+            logger.warning("No context found in PostgreSQL for the given filters.")
+            raise HTTPException(status_code=404, detail="No ingested data found for this class and chapter.")
+        
+        logger.info(f"Successfully retrieved {len(docs)} chunks from the database.")
+    except Exception as e:
+        logger.error(f"Database retrieval failed: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Database retrieval failed.")
 
     # 2. Initialize the Standard LLM securely using .env variables
     deepseek_api_key = os.getenv("DEEPSEEK_API_KEY")
     if not deepseek_api_key or "your-deepseek-api-key" in deepseek_api_key:
-         raise HTTPException(status_code=500, detail="CRITICAL: DEEPSEEK_API_KEY is missing or invalid in .env file.")
+        logger.error("DEEPSEEK_API_KEY is missing or invalid.")
+        raise HTTPException(status_code=500, detail="CRITICAL: DEEPSEEK_API_KEY is missing or invalid in .env file.")
     
     llm = ChatOpenAI(
-        model="deepseek-reasoner", 
+        model="deepseek-chat", 
         api_key=deepseek_api_key, 
         base_url="https://api.deepseek.com",
         temperature=0.2
@@ -93,6 +109,8 @@ async def generate_lesson_plan(
     - Generate EXACTLY {num_short_answers} Short Answer Questions.
     - Generate EXACTLY {num_case_based} Case-Based Questions.
     
+    IMPORTANT RULE: If any of the requested quantities above are 0, you MUST still include the required JSON key, but set its value to an empty array [].
+    
     {format_instructions}
     
     Context from Chapter:
@@ -105,6 +123,7 @@ async def generate_lesson_plan(
     ])
 
     # 5. Execute the Chain (Prompt -> LLM -> Parser)
+    logger.info("Sending prompt to DeepSeek API...")
     chain = prompt | llm | parser
     
     try:
@@ -118,6 +137,8 @@ async def generate_lesson_plan(
             "num_case_based": num_case_based,
             "format_instructions": parser.get_format_instructions()
         })
+        logger.info("Successfully generated and parsed JSON from DeepSeek.")
         return result
     except Exception as e:
+        logger.error(f"LLM Generation or Parsing failed: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"LLM Generation failed: {str(e)}")

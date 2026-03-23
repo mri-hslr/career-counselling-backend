@@ -10,3 +10,4 @@ pgvector
 pypdf
 langchain-openai
 openai
+pymupdf

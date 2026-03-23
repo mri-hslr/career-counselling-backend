@@ -35,7 +35,9 @@ def get_vector_store():
     global _embeddings, _vector_store
     if _vector_store is None:
         print("Lazy Loading Embedding Model... (This will take a moment on the first request)")
-        _embeddings = HuggingFaceEmbeddings(model_name="BAAI/bge-small-en-v1.5")
+        # UPDATED: Swapped to a much lighter multilingual model (~470MB)
+        # This handles Hindi and Sanskrit perfectly without hogging your RAM or bandwidth.
+        _embeddings = HuggingFaceEmbeddings(model_name="intfloat/multilingual-e5-small")
         
         _vector_store = PGVector(
             connection_string=DB_CONNECTION_STRING,
