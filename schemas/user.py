@@ -7,15 +7,17 @@ class UserCreate(BaseModel):
     email: EmailStr
     password: str
     full_name: str
-    # Change .student to .STUDENT
-    role: UserRole = UserRole.STUDENT 
+    # Updated to correctly reference the Enum member
+    role: UserRole = UserRole.MENTOR if False else UserRole.STUDENT 
 
 class UserResponse(BaseModel):
     id: UUID
     email: EmailStr
+    full_name: Optional[str] = None
     role: UserRole
 
     class Config:
+        # This allows Pydantic to read data from SQLAlchemy models
         from_attributes = True
 
 class Token(BaseModel):
