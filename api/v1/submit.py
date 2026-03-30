@@ -16,6 +16,7 @@ logger = logging.getLogger(__name__)
 # 3. The Mapping Logic (Verified against your SQL results)
 # This maps the "Frontend Module Name" to the "Actual Database Column"
 COLUMN_MAPPING = {
+    "profile": "profile_data",
     "academic": "academic_data",
     "aptitude": "apti_data",
     "personality": "personality_data",
