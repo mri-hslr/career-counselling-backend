@@ -8,7 +8,7 @@ from models.compass import Profile, AcademicProfile, PsychometricProfile, Lifest
 from models.assessments import Test, Result
 from models.careers import Career, Skill, CareerSkill, UserSkill, StudentInsight
 from models.roadmaps import Roadmap, RoadmapMilestone
-from models.mentorship import Mentor, MentorAvailability, SessionLog, ChatMessage, MentorFeedback, ParentFeedback
+from models.mentorship import Mentor, MentorAvailability, SessionLog, ChatMessage, MentorFeedback, ParentFeedback, ParentStudentLink
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -20,11 +20,11 @@ def reset_db():
         logger.warning("Dropping all existing relational tables (CASCADE)...")
         # We drop the new tables as well in case we run this script again later
         conn.execute(text("""
-            DROP TABLE IF EXISTS users, profiles, academic_profiles, psychometric_profiles, 
-            lifestyle_profiles, financial_profiles, aspiration_profiles, mentors, 
-            mentor_availability, tests, results, careers, skills, career_skills, 
-            user_skills, student_insights, roadmaps, roadmap_milestones, sessions, 
-            chat_messages, mentor_feedback, parent_feedback, 
+            DROP TABLE IF EXISTS users, profiles, academic_profiles, psychometric_profiles,
+            lifestyle_profiles, financial_profiles, aspiration_profiles, mentors,
+            mentor_availability, tests, results, careers, skills, career_skills,
+            user_skills, student_insights, roadmaps, roadmap_milestones, sessions,
+            chat_messages, mentor_feedback, parent_feedback, parent_student_links,
             langchain_pg_embedding, langchain_pg_collection CASCADE;
         """))
     

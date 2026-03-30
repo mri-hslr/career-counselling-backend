@@ -10,6 +10,9 @@ from api.v1.aptitude import router as aptitude_router
 from api.v1.profile import router as profile_router
 from api.v1.career import router as career_router
 from api.v1.roadmap import router as roadmap_router
+from router.personality import router as personality_router
+from api.v1.mentor import router as mentor_router
+from api.v1.parent import router as parent_router
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
@@ -37,6 +40,9 @@ app.include_router(submit_router)
 app.include_router(aptitude_router)
 app.include_router(profile_router)
 app.include_router(career_router)
+app.include_router(personality_router)
+app.include_router(mentor_router)
+app.include_router(parent_router)
 @app.get("/")
 async def root():
     return {"message": "Career Counseling AI API is running."}

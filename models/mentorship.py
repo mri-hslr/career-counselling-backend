@@ -60,3 +60,10 @@ class ParentFeedback(Base):
     behavior_insights = Column(Text)
     study_habits = Column(Text)
     logged_at = Column(DateTime(timezone=True), server_default=func.now())
+
+class ParentStudentLink(Base):
+    __tablename__ = "parent_student_links"
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    parent_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    student_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    linked_at = Column(DateTime(timezone=True), server_default=func.now())

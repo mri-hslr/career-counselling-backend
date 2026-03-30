@@ -1,71 +1,323 @@
 import os
-from typing import List
-from fastapi import APIRouter, Depends, HTTPException
+import logging
+from typing import List, Optional
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
+from sqlalchemy.orm import Session
 from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import PydanticOutputParser
 
+from core.database import get_db
+from api.deps import get_current_user
+from models.users import User
+from models.mentorship import MentorFeedback, ParentFeedback
+
+logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/v1/career", tags=["Career Roadmap"])
+
+
+# ── Response Schema ───────────────────────────────────────────────────────────
 
 class WeeklyTask(BaseModel):
     week_number: int
-    topic: str = Field(description="The core focus of this specific week")
-    tasks: List[str] = Field(description="3-4 high-impact actionable items")
+    topic: str = Field(description="Specific focus for this week")
+    tasks: List[str] = Field(description="3-5 concrete, actionable tasks each completable in one session")
+    resources: List[str] = Field(description="2-3 free or low-cost resources (official docs, YouTube, freeCodeCamp, etc.)")
+
 
 class RoadmapPhase(BaseModel):
+    phase_number: int
     phase_title: str
     description: str
     importance: str = Field(description="CRITICAL | STRATEGIC | SPECIALIZATION")
     duration_weeks: int
+    skills_targeted: List[str] = Field(description="Specific skills built in this phase")
     weekly_breakdown: List[WeeklyTask]
-    milestone_project: str = Field(description="A specific project to validate this phase")
+    milestone_project: str = Field(description="A real, portfolio-worthy project that proves phase completion")
+    success_criteria: str = Field(description="Measurable condition that proves the student is ready to advance")
+
 
 class CareerRoadmapResponse(BaseModel):
     career_title: str
+    student_level: str = Field(description="BEGINNER | INTERMEDIATE | ADVANCED — assessed from student profile")
     difficulty_level: str
     total_duration: str
+    daily_commitment: str = Field(description="Realistic daily hours derived from student's lifestyle data")
     phases: List[RoadmapPhase]
+    mentor_adjustments: str = Field(default="", description="How mentor action items shaped this roadmap")
+    parent_adjustments: str = Field(default="", description="How parent observations shaped this roadmap")
+
+
+# ── Gold Prompt ───────────────────────────────────────────────────────────────
+
+_GOLD_SYSTEM_PROMPT = """\
+You are an Expert Career Architect and Personalized Learning Coach. \
+Build a deeply personalized, achievable 6-month roadmap for the student below. \
+This is NOT a generic tutorial — every decision must reflect THIS student's data.
+
+╔══════════════════════════════════════════════════════╗
+  STUDENT PROFILE
+╚══════════════════════════════════════════════════════╝
+Target Career  : {career_goal}
+Long-term Vision: {vision}
+Academic Background: {academic_summary}
+Aptitude Scores: {aptitude_summary}
+Personality / Learning Style: {personality_summary}
+Daily Study Availability: {study_hours}
+Financial Constraints: {financial_context}
+
+╔══════════════════════════════════════════════════════╗
+  MENTOR ACTION ITEMS  ← HIGH PRIORITY, address these first
+╚══════════════════════════════════════════════════════╝
+{mentor_action_items}
+
+╔══════════════════════════════════════════════════════╗
+  PARENT OBSERVATIONS  ← behavioral context
+╚══════════════════════════════════════════════════════╝
+{parent_observations}
+
+╔══════════════════════════════════════════════════════╗
+  MANDATORY RULES
+╚══════════════════════════════════════════════════════╝
+1. The roadmap title and every phase must directly serve "{career_goal}". \
+   Never substitute with a generic career path.
+2. Start from the student's ACTUAL level — derive it from their academic/aptitude data. \
+   Do not assume prior knowledge they haven't demonstrated.
+3. Respect study availability: fewer hours = fewer topics, higher ruthless prioritization.
+4. If mentor flagged specific gaps, those skills MUST appear in Phase 1 or Phase 2.
+5. If parent noted behavioral issues (distraction, stress, inconsistency), \
+   embed matching study-habit strategies into the relevant phase description.
+6. Every task must start with an action verb and be completable in one 2–4 hour session.
+7. Resources must be free or affordable: official docs, YouTube, freeCodeCamp, \
+   The Odin Project, MDN, GitHub repos, open textbooks. No paid gatekeeping unless critical.
+8. The milestone_project per phase must be a real, buildable deliverable for a portfolio.
+9. success_criteria must be objectively measurable \
+   (e.g., "Build X from scratch without reference" or "Score 80%+ on Y practice test").
+10. Generate exactly 5 phases covering the full stated duration realistically.
+11. In mentor_adjustments, explicitly state which mentor action items you addressed and where.
+12. In parent_adjustments, explicitly state how you adapted the plan to parent observations.
+
+{format_instructions}
+"""
+
+
+# ── LLM Helpers ──────────────────────────────────────────────────────────────
+
+def _build_llm(api_key: str, base_url: str, model: str) -> ChatOpenAI:
+    return ChatOpenAI(
+        model=model,
+        openai_api_key=api_key,
+        openai_api_base=base_url,
+        temperature=0.3,
+    )
+
+
+async def generate_roadmap(
+    career_goal: str,
+    vision: str = "",
+    academic_summary: str = "Not provided",
+    aptitude_summary: str = "Not provided",
+    personality_summary: str = "Not provided",
+    study_hours: str = "2-3 hours/day",
+    financial_context: str = "Standard",
+    mentor_action_items: str = "None",
+    parent_observations: str = "None",
+) -> CareerRoadmapResponse:
+    """Try Groq first, fall back to DeepSeek on failure."""
+    parser = PydanticOutputParser(pydantic_object=CareerRoadmapResponse)
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", _GOLD_SYSTEM_PROMPT),
+        ("human", "Generate the personalized roadmap for career goal: {career_goal}"),
+    ])
+    invoke_args = {
+        "career_goal": career_goal,
+        "vision": vision or career_goal,
+        "academic_summary": academic_summary,
+        "aptitude_summary": aptitude_summary,
+        "personality_summary": personality_summary,
+        "study_hours": study_hours,
+        "financial_context": financial_context,
+        "mentor_action_items": mentor_action_items,
+        "parent_observations": parent_observations,
+        "format_instructions": parser.get_format_instructions(),
+    }
+
+    groq_key = os.getenv("GROQ_API_KEY")
+    if groq_key:
+        try:
+            chain = prompt | _build_llm(groq_key, "https://api.groq.com/openai/v1", "llama-3.3-70b-versatile") | parser
+            return await chain.ainvoke(invoke_args)
+        except Exception as e:
+            logger.warning(f"Groq failed, switching to DeepSeek: {e}")
+
+    deepseek_key = os.getenv("DEEPSEEK_API_KEY")
+    if deepseek_key:
+        try:
+            chain = prompt | _build_llm(deepseek_key, "https://api.deepseek.com", "deepseek-chat") | parser
+            return await chain.ainvoke(invoke_args)
+        except Exception as e:
+            logger.error(f"DeepSeek also failed: {e}")
+
+    raise HTTPException(
+        status_code=500,
+        detail="Roadmap generation failed: both Groq and DeepSeek are unavailable.",
+    )
+
+
+# ── Context Extractors ────────────────────────────────────────────────────────
+
+def _academic_summary(data: Optional[dict]) -> str:
+    if not isinstance(data, dict):
+        return "Not provided"
+    keys = [
+        ("overall_percentage_band", "Grade band"),
+        ("strongest_subject", "Strong in"),
+        ("weakest_subject", "Weak in"),
+        ("favorite_subject", "Enjoys"),
+        ("learning_style", "Learning style"),
+        ("study_hours_home", "Study hours at home"),
+    ]
+    parts = [f"{label}: {data[k]}" for k, label in keys if data.get(k)]
+    return "; ".join(parts) or "Not provided"
+
+
+def _aptitude_summary(data: Optional[dict]) -> str:
+    if not isinstance(data, dict):
+        return "Not provided"
+    # Handle both raw score dicts and nested structures
+    score_keys = [
+        ("quantitative", "Quantitative"), ("quantitative_score", "Quantitative"),
+        ("logical", "Logical Reasoning"), ("logical_score", "Logical Reasoning"),
+        ("verbal", "Verbal"), ("verbal_score", "Verbal"),
+    ]
+    seen = set()
+    parts = []
+    for k, label in score_keys:
+        if data.get(k) and label not in seen:
+            parts.append(f"{label}: {data[k]}")
+            seen.add(label)
+    return "; ".join(parts) if parts else str(data)[:300]
+
+
+def _personality_summary(data: Optional[dict]) -> str:
+    if not isinstance(data, dict):
+        return "Not provided"
+    trait_map = {
+        "O": "Openness/Creative", "C": "Conscientiousness/Disciplined",
+        "E": "Extraversion/Social", "A": "Agreeableness/Empathetic",
+        "N": "Neuroticism/Stress-prone",
+    }
+    parts = []
+    if data.get("dominant_traits"):
+        readable = [trait_map.get(t, t) for t in data["dominant_traits"]]
+        parts.append(f"Dominant: {', '.join(readable)}")
+    if data.get("scores"):
+        parts.append(f"OCEAN scores: {data['scores']}")
+    return "; ".join(parts) or "Not provided"
+
+
+def _study_hours(lifestyle: Optional[dict]) -> str:
+    if not isinstance(lifestyle, dict):
+        return "Not specified"
+    val = lifestyle.get("study_hours") or lifestyle.get("study_hours_home") or ""
+    return str(val) if val else "2-3 hours/day"
+
+
+def _financial_context(data: Optional[dict]) -> str:
+    if not isinstance(data, dict):
+        return "Standard"
+    keys = [
+        ("income_band", "Income"), ("affordability_level", "Affordability"),
+        ("coaching_access", "Coaching access"),
+    ]
+    parts = [f"{label}: {data[k]}" for k, label in keys if data.get(k)]
+    return "; ".join(parts) or "Standard"
+
+
+# ── Endpoint ──────────────────────────────────────────────────────────────────
 
 @router.get("/roadmap", response_model=CareerRoadmapResponse)
-async def get_career_roadmap():
-    target_job = "Full Stack Software Engineer (Node/React/Postgres)"
-    GROQ_API_KEY=os.getenv("GROQ_API_KEY")
-    
-    # Groq is compatible with ChatOpenAI client by changing base_url
-    llm = ChatOpenAI(
-        model="llama-3.3-70b-versatile", 
-        openai_api_key=GROQ_API_KEY, 
-        openai_api_base="https://api.groq.com/openai/v1",
-        temperature=0.2 # Lower temperature for better JSON structure adherence
-    )
-    
-    parser = PydanticOutputParser(pydantic_object=CareerRoadmapResponse)
-
-    system_prompt = """
-    You are an Elite Curriculum Architect. Generate a hyper-specific, 6-month weekly roadmap for becoming a {job}.
-    
-    STRATEGIC GUIDELINES:
-    1. NODAL STRUCTURE: Break the journey into 5 distinct phases. Each phase MUST contain a weekly breakdown.
-    2. DEPTH: Week 1 shouldn't just be 'Learn HTML'. It should be 'Semantic HTML & Accessibility Standards'.
-    3. MODERN STACK: Default to TypeScript, Next.js (App Router), Tailwind CSS, PostgreSQL (Prisma), and Docker.
-    4. TASKS: Every task must be an action (e.g., 'Implement JWT using jose', not 'Read about JWT').
-    
-    {format_instructions}
+async def get_career_roadmap(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+    career: Optional[str] = Query(
+        default=None,
+        description="Career title override — sent by the frontend from the student's AI recommendation selection.",
+    ),
+):
     """
+    Generate a fully personalized roadmap for the authenticated student.
 
-    prompt = ChatPromptTemplate.from_messages([
-        ("system", system_prompt),
-        ("human", "Build a high-velocity 6-month Nodal Roadmap for: {job}.")
-    ])
+    Priority order for career goal:
+      1. `career` query param  (set by frontend after AI recommendation)
+      2. `aspiration_data.dream_career`  (saved from the aspiration assessment)
+      3. Fallback: "Software Engineer"
 
-    try:
-        chain = prompt | llm | parser
-        response = chain.invoke({
-            "job": target_job,
-            "format_instructions": parser.get_format_instructions()
-        })
-        return response
-    except Exception as e:
-        print(f"Error: {e}")
-        raise HTTPException(status_code=500, detail="Roadmap Generation Failed via Groq Engine.")
+    Works even if the student hasn't completed every assessment — uses
+    whatever profile data is available and fills gaps gracefully.
+    """
+    # 1. Resolve career goal (frontend param wins, then DB, then fallback)
+    career_goal = (
+        career
+        or (
+            isinstance(current_user.aspiration_data, dict)
+            and (
+                current_user.aspiration_data.get("dream_career")
+                or current_user.aspiration_data.get("life_direction")
+            )
+        )
+        or "Software Engineer"
+    )
+    # strip any truthy-but-empty strings from the boolean short-circuit
+    if not isinstance(career_goal, str):
+        career_goal = "Software Engineer"
+
+    vision = ""
+    if isinstance(current_user.aspiration_data, dict):
+        vision = (
+            current_user.aspiration_data.get("ten_year_vision")
+            or current_user.aspiration_data.get("five_year_goal")
+            or ""
+        )
+
+    # 2. Mentor action items (last 3 sessions for this student)
+    mentor_rows = (
+        db.query(MentorFeedback)
+        .filter(MentorFeedback.student_id == current_user.id)
+        .order_by(MentorFeedback.submitted_at.desc())
+        .limit(3)
+        .all()
+    )
+    mentor_action_items = (
+        "\n".join(f"• {r.action_items}" for r in mentor_rows if r.action_items)
+        or "None"
+    )
+
+    # 3. Parent observations (last 3 entries)
+    parent_rows = (
+        db.query(ParentFeedback)
+        .filter(ParentFeedback.student_id == current_user.id)
+        .order_by(ParentFeedback.logged_at.desc())
+        .limit(3)
+        .all()
+    )
+    parent_observations = (
+        "\n".join(
+            f"• Study habits: {r.study_habits or 'N/A'} | Behavior: {r.behavior_insights or 'N/A'}"
+            for r in parent_rows
+        )
+        or "None"
+    )
+
+    return await generate_roadmap(
+        career_goal=career_goal,
+        vision=vision,
+        academic_summary=_academic_summary(current_user.academic_data),
+        aptitude_summary=_aptitude_summary(current_user.apti_data),
+        personality_summary=_personality_summary(current_user.personality_data),
+        study_hours=_study_hours(current_user.lifestyle_data),
+        financial_context=_financial_context(current_user.financial_data),
+        mentor_action_items=mentor_action_items,
+        parent_observations=parent_observations,
+    )
