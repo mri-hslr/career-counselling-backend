@@ -12,7 +12,7 @@ from langchain_core.output_parsers import PydanticOutputParser
 from core.database import get_db
 from api.deps import get_current_user
 from models.users import User
-from models.mentorship import MentorFeedback, ParentFeedback
+from models.mentorship import MentorFeedback, ParentFeedback, MentorshipRequest, Mentor, ParentStudentLink
 from models.roadmaps import Roadmap, RoadmapPhase, RoadmapTask
 
 logger = logging.getLogger(__name__)
@@ -377,6 +377,50 @@ def start_roadmap(current_user: User = Depends(get_current_user), db: Session = 
 def get_current_roadmap(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     roadmap = db.query(Roadmap).filter(Roadmap.student_id == current_user.id).first()
     if not roadmap: raise HTTPException(status_code=404, detail="No active roadmap.")
+    return roadmap
+
+
+@router.get("/student/{student_id}", response_model=RoadmapResponse)
+def get_student_roadmap(
+    student_id: UUID,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Returns a student's saved roadmap with phase progress.
+    Authorized for:
+    - Mentor: must have an accepted/approved connection with the student.
+    - Parent: must be linked to the student via ParentStudentLink.
+    """
+    is_authorized = False
+
+    # Check: is caller a mentor with an accepted connection to this student?
+    mentor_profile = db.query(Mentor).filter(Mentor.user_id == current_user.id).first()
+    if mentor_profile:
+        connection = db.query(MentorshipRequest).filter(
+            MentorshipRequest.student_id == student_id,
+            MentorshipRequest.mentor_id == mentor_profile.id,
+            MentorshipRequest.status.in_(["accepted", "approved"]),
+        ).first()
+        if connection:
+            is_authorized = True
+
+    # Check: is caller a parent linked to this student?
+    if not is_authorized:
+        link = db.query(ParentStudentLink).filter(
+            ParentStudentLink.parent_id == current_user.id,
+            ParentStudentLink.student_id == student_id,
+        ).first()
+        if link:
+            is_authorized = True
+
+    if not is_authorized:
+        raise HTTPException(status_code=403, detail="Not authorized to view this student's roadmap.")
+
+    roadmap = db.query(Roadmap).filter(Roadmap.student_id == student_id).first()
+    if not roadmap:
+        raise HTTPException(status_code=404, detail="This student has not started a roadmap yet.")
+
     return roadmap
 
 

@@ -4,7 +4,7 @@ import json
 import psycopg2
 from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 
 # 1. Router Setup
 router = APIRouter(prefix="/api/v1/assessments", tags=["Submission"])
@@ -82,6 +82,92 @@ async def submit_generic_assessment(submission: UniversalSubmission):
     except Exception as e:
         logger.error(f"Database Error during {key} submission: {str(e)}")
         raise HTTPException(
-            status_code=500, 
+            status_code=500,
             detail="Internal Server Error: Data persistence failed."
         )
+
+
+# ── TEST PROGRESS (Save & Resume) ─────────────────────────────────────────────
+
+class SaveProgressBody(BaseModel):
+    user_id: str
+    test_key: str  # e.g. "aptitude" — stored as a marker in the relevant JSONB column
+    session_questions: list  # serialized question objects
+    answers: Dict[str, Any]  # { question_index_or_id: selected_letter }
+    current_index: int
+
+class GetProgressBody(BaseModel):
+    user_id: str
+    test_key: str
+
+@router.patch("/save-progress")
+async def save_test_progress(body: SaveProgressBody):
+    """
+    Saves mid-test progress into the user's JSONB column so they can resume later.
+    Stores a '_progress' key inside the relevant column (e.g. apti_data._progress).
+    """
+    key_map = {
+        "aptitude": "apti_data",
+    }
+    target_col = key_map.get(body.test_key.lower())
+    if not target_col:
+        raise HTTPException(status_code=400, detail=f"Unsupported test_key: {body.test_key}")
+
+    progress_payload = {
+        "_status": "in_progress",
+        "_session_questions": body.session_questions,
+        "_answers": body.answers,
+        "_current_index": body.current_index,
+    }
+
+    # Merge into the existing JSONB column using ||
+    query = f"""
+    UPDATE users
+    SET {target_col} = COALESCE({target_col}, '{{}}'::jsonb) || %s::jsonb,
+        updated_at = NOW()
+    WHERE id = %s;
+    """
+    try:
+        with psycopg2.connect(DATABASE_URL) as conn:
+            with conn.cursor() as cur:
+                cur.execute(query, (json.dumps(progress_payload), body.user_id))
+            conn.commit()
+        return {"status": "saved", "current_index": body.current_index}
+    except Exception as e:
+        logger.error(f"save-progress error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to save progress.")
+
+
+@router.get("/progress/{test_key}/{user_id}")
+async def get_test_progress(test_key: str, user_id: str):
+    """
+    Returns in-progress test state if it exists, so the frontend can resume.
+    Returns null if no in-progress session found.
+    """
+    key_map = {"aptitude": "apti_data"}
+    target_col = key_map.get(test_key.lower())
+    if not target_col:
+        raise HTTPException(status_code=400, detail=f"Unsupported test_key: {test_key}")
+
+    query = f"SELECT {target_col} FROM users WHERE id = %s;"
+    try:
+        with psycopg2.connect(DATABASE_URL) as conn:
+            with conn.cursor() as cur:
+                cur.execute(query, (user_id,))
+                row = cur.fetchone()
+
+        if not row or not row[0]:
+            return {"in_progress": False}
+
+        col_data = row[0] if isinstance(row[0], dict) else json.loads(row[0])
+        if col_data.get("_status") == "in_progress":
+            return {
+                "in_progress": True,
+                "session_questions": col_data.get("_session_questions", []),
+                "answers": col_data.get("_answers", {}),
+                "current_index": col_data.get("_current_index", 0),
+            }
+        return {"in_progress": False}
+    except Exception as e:
+        logger.error(f"get-progress error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to fetch progress.")

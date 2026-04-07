@@ -4,17 +4,14 @@ import logging
 from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
 
 from core.database import get_db
 from api.deps import get_current_user
 from models.users import User, UserRole
 from models.mentorship import ParentStudentLink, ParentFeedback, MentorFeedback
-from api.v1.roadmap import (
-    generate_roadmap, CareerRoadmapResponse,
-    _academic_summary, _aptitude_summary, _personality_summary,
-    _study_hours, _financial_context,
-)
+from models.roadmaps import Roadmap
+from api.v1.roadmap import RoadmapResponse
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/v1", tags=["Parent-Student Linking"])
@@ -101,10 +98,10 @@ def link_student_to_parent(
         raise HTTPException(status_code=500, detail="Failed to create link.")
 
 
-# ── Parent: read student's roadmap (auth-gated) ──────────────────────────────
+# ── Parent: read student's saved roadmap from DB ─────────────────────────────
 
-@router.get("/parent/roadmaps/{student_id}", response_model=CareerRoadmapResponse)
-async def get_linked_student_roadmap(
+@router.get("/parent/roadmaps/{student_id}", response_model=RoadmapResponse)
+def get_linked_student_roadmap(
     student_id: UUID,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
@@ -119,56 +116,17 @@ async def get_linked_student_roadmap(
     if not link:
         raise HTTPException(status_code=403, detail="You are not linked to this student.")
 
-    student = db.query(User).filter(User.id == student_id).first()
-    if not student:
-        raise HTTPException(status_code=404, detail="Student not found.")
+    roadmap = (
+        db.query(Roadmap)
+        .options(joinedload(Roadmap.phases).joinedload("tasks"))
+        .filter(Roadmap.student_id == student_id)
+        .order_by(Roadmap.created_at.desc())
+        .first()
+    )
+    if not roadmap:
+        raise HTTPException(status_code=404, detail="No roadmap found for this student yet.")
 
-    # Career goal from student's aspiration data
-    career_goal = "Software Engineer"
-    vision = ""
-    if isinstance(student.aspiration_data, dict):
-        career_goal = student.aspiration_data.get("dream_career") or career_goal
-        vision = student.aspiration_data.get("ten_year_vision") or ""
-
-    # Parent observations
-    parent_rows = (
-        db.query(ParentFeedback)
-        .filter(ParentFeedback.student_id == student_id)
-        .order_by(ParentFeedback.logged_at.desc())
-        .limit(3)
-        .all()
-    )
-    parent_observations = (
-        "\n".join(
-            f"• Study: {f.study_habits or 'N/A'} | Behavior: {f.behavior_insights or 'N/A'}"
-            for f in parent_rows
-        ) or "None"
-    )
-
-    # Mentor action items
-    mentor_rows = (
-        db.query(MentorFeedback)
-        .filter(MentorFeedback.student_id == student_id)
-        .order_by(MentorFeedback.submitted_at.desc())
-        .limit(3)
-        .all()
-    )
-    mentor_action_items = (
-        "\n".join(f"• {r.action_items}" for r in mentor_rows if r.action_items)
-        or "None"
-    )
-
-    return await generate_roadmap(
-        career_goal=career_goal,
-        vision=vision,
-        academic_summary=_academic_summary(student.academic_data),
-        aptitude_summary=_aptitude_summary(student.apti_data),
-        personality_summary=_personality_summary(student.personality_data),
-        study_hours=_study_hours(student.lifestyle_data),
-        financial_context=_financial_context(student.financial_data),
-        mentor_action_items=mentor_action_items,
-        parent_observations=parent_observations,
-    )
+    return roadmap
 
 
 # ── Parent: submit behavioral/study feedback ─────────────────────────────────

@@ -21,4 +21,6 @@ class Result(Base):
     accuracy_score = Column(Float)
     consistency_score = Column(Float)
     weakness_mapping = Column(JSONB)
+    status = Column(String(20), default="completed", nullable=False)  # 'in_progress' | 'completed'
+    partial_answers = Column(JSONB, nullable=True)  # stores session state mid-test
     completed_at = Column(DateTime(timezone=True), server_default=func.now())

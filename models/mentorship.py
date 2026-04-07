@@ -34,10 +34,12 @@ class MentorshipRequest(Base):
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     student_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
     mentor_id = Column(UUID(as_uuid=True), ForeignKey("mentors.id", ondelete="CASCADE"), nullable=False)
-    availability_id = Column(UUID(as_uuid=True), ForeignKey("mentor_availability.id", ondelete="CASCADE"), nullable=False)
+    availability_id = Column(UUID(as_uuid=True), ForeignKey("mentor_availability.id", ondelete="CASCADE"), nullable=True)
     message = Column(Text, nullable=True)
     status = Column(String, default="pending", nullable=False)
+    request_type = Column(String, default="session", nullable=False)  # 'session' or 'connection'
     created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
 class SessionLog(Base):
     __tablename__ = "sessions"

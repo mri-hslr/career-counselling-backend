@@ -88,5 +88,8 @@ def get_user_progress_and_data(current_user: User = Depends(get_current_user), d
             "profile_done": len(academic) > 0, 
             "aptitude_done": len(aptitude) > 0,
             "personality_done": len(personality) > 0
-        }
+        }, # <--- ADD THIS EXACT COMMA
+        "apti_data": aptitude,            
+        "personality_data": personality,  
+        "academic_data": academic         
     }

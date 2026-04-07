@@ -12,7 +12,7 @@ from fastapi import (
 )
 from jose import jwt, JWTError
 from pydantic import BaseModel, Field
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
 from sqlalchemy import or_
 from sentence_transformers import SentenceTransformer
 
@@ -80,11 +80,22 @@ manager = ConnectionManager()
 class MentorResponse(BaseModel):
     id: UUID
     user_id: UUID
+    full_name: Optional[str] = None
     expertise: str
     bio: Optional[str] = None
     years_experience: int
     rating: float
     is_verified: bool
+    class Config:
+        from_attributes = True
+
+class AvailabilitySlotResponse(BaseModel):
+    id: UUID
+    mentor_id: UUID
+    day_of_week: int
+    start_time: str
+    end_time: str
+    is_booked: bool
     class Config:
         from_attributes = True
 
@@ -103,14 +114,34 @@ class MentorAvailabilityUpdate(BaseModel):
 
 class RequestIn(BaseModel):
     mentor_id: UUID
-    availability_id: UUID 
+    availability_id: UUID
     message: Optional[str] = None
+
+class ConnectionRequestIn(BaseModel):
+    mentor_id: UUID
+    message: Optional[str] = None
+
+class StudentProfileSnapshot(BaseModel):
+    student_id: UUID
+    full_name: Optional[str]
+    apti_data: Optional[dict]
+    personality_data: Optional[dict]
+    academic_data: Optional[dict]
+    aspiration_data: Optional[dict]
+
+class PendingConnectionResponse(BaseModel):
+    request_id: UUID
+    student_id: UUID
+    student_name: Optional[str]
+    message: Optional[str]
+    created_at: datetime
+    request_type: str
 
 class UpcomingSessionResponse(BaseModel):
     session_id: UUID
     scheduled_at: datetime
     other_party_name: str
-    other_user_id: UUID
+    other_user_id: Optional[UUID]
     is_live: bool
     seconds_until_start: int
 
@@ -164,18 +195,45 @@ def search_mentors(career_goal: str = Query(...), db: Session = Depends(get_db))
     search_vector = embed_model.encode(career_goal).tolist()
     results = (
         db.query(Mentor)
+        .options(joinedload(Mentor.user))
         .filter(Mentor.is_verified == True)
         .order_by(Mentor.expertise_vector.cosine_distance(search_vector))
-        .limit(5).all()
+        .limit(10).all()
     )
-    return results
+    return [
+        MentorResponse(
+            id=m.id,
+            user_id=m.user_id,
+            full_name=m.user.full_name if m.user else None,
+            expertise=m.expertise,
+            bio=m.bio,
+            years_experience=m.years_experience,
+            rating=m.rating,
+            is_verified=m.is_verified,
+        )
+        for m in results
+    ]
 
 @router.get("/mentorship/mentors/{mentor_id}", response_model=MentorResponse)
 def get_mentor_detail(mentor_id: UUID, db: Session = Depends(get_db)):
-    mentor = db.query(Mentor).filter(Mentor.id == mentor_id).first()
+    mentor = (
+        db.query(Mentor)
+        .options(joinedload(Mentor.user))
+        .filter(Mentor.id == mentor_id)
+        .first()
+    )
     if not mentor:
         raise HTTPException(status_code=404, detail="Mentor not found.")
-    return mentor
+    return MentorResponse(
+        id=mentor.id,
+        user_id=mentor.user_id,
+        full_name=mentor.user.full_name if mentor.user else None,
+        expertise=mentor.expertise,
+        bio=mentor.bio,
+        years_experience=mentor.years_experience,
+        rating=mentor.rating,
+        is_verified=mentor.is_verified,
+    )
 
 # ── AVAILABILITY & SESSIONS ───────────────────────────────────────────────
 
@@ -305,11 +363,11 @@ async def websocket_chat(
         await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
         return
 
-    # 3. AUTHORIZATION — must have an approved mentorship link
+    # 3. AUTHORIZATION — must have an approved or accepted mentorship link
     approved = db.query(MentorshipRequest).filter(
         MentorshipRequest.student_id == student_user_id,
         MentorshipRequest.mentor_id == mentor_profile_id,
-        MentorshipRequest.status == "approved"
+        MentorshipRequest.status.in_(["approved", "accepted"])
     ).first()
     if not approved:
         await websocket.accept()
@@ -340,6 +398,7 @@ async def websocket_chat(
                     db.commit()
                     await manager.broadcast(room, {
                         "event": "NEW_MESSAGE",
+                        "sender_id": str(user.id),
                         "sender": user.full_name,
                         "message": msg_text,
                         "timestamp": datetime.now(timezone.utc).isoformat()
@@ -484,7 +543,172 @@ async def join_video_session(session_id: UUID, current_user: User = Depends(get_
 
     return {"token": participant_token, "meeting_id": session.dyte_meeting_id}
 
-@router.get("/availability/{mentor_id}")
+@router.get("/availability/{mentor_id}", response_model=List[AvailabilitySlotResponse])
 def get_mentor_availability(mentor_id: UUID, db: Session = Depends(get_db)):
-    pending = db.query(MentorshipRequest.availability_id).filter(MentorshipRequest.status == "pending").subquery()
-    return db.query(MentorAvailability).filter(MentorAvailability.mentor_id == mentor_id, MentorAvailability.is_booked == False, ~MentorAvailability.id.in_(pending)).all()
+    # Must exclude NULL availability_id rows (connection requests) — SQL NOT IN (... NULL ...) = FALSE
+    pending = db.query(MentorshipRequest.availability_id).filter(
+        MentorshipRequest.status == "pending",
+        MentorshipRequest.availability_id.isnot(None)
+    ).subquery()
+    slots = db.query(MentorAvailability).filter(
+        MentorAvailability.mentor_id == mentor_id,
+        MentorAvailability.is_booked == False,
+        ~MentorAvailability.id.in_(pending)
+    ).all()
+    return [
+        AvailabilitySlotResponse(
+            id=s.id,
+            mentor_id=s.mentor_id,
+            day_of_week=s.day_of_week,
+            start_time=str(s.start_time),
+            end_time=str(s.end_time),
+            is_booked=s.is_booked,
+        )
+        for s in slots
+    ]
+
+# ── CONNECTION REQUESTS (no availability required) ────────────────────────────
+
+@router.post("/connections/request", status_code=201)
+def send_connection_request(body: ConnectionRequestIn, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Student sends a generic 'I want to connect' request to a mentor."""
+    if current_user.role != UserRole.STUDENT:
+        raise HTTPException(status_code=403, detail="Student role required.")
+
+    mentor = db.query(Mentor).filter(Mentor.id == body.mentor_id).first()
+    if not mentor:
+        raise HTTPException(status_code=404, detail="Mentor not found.")
+
+    # Prevent duplicate pending/accepted connection requests
+    existing = db.query(MentorshipRequest).filter(
+        MentorshipRequest.student_id == current_user.id,
+        MentorshipRequest.mentor_id == body.mentor_id,
+        MentorshipRequest.request_type == "connection",
+        MentorshipRequest.status.in_(["pending", "accepted"])
+    ).first()
+    if existing:
+        raise HTTPException(status_code=400, detail="A connection request already exists with this mentor.")
+
+    new_req = MentorshipRequest(
+        student_id=current_user.id,
+        mentor_id=body.mentor_id,
+        availability_id=None,
+        message=body.message,
+        status="pending",
+        request_type="connection"
+    )
+    db.add(new_req)
+    db.commit()
+    return {"message": "Connection request sent.", "request_id": str(new_req.id)}
+
+
+@router.get("/mentors/requests/pending")
+def get_pending_connection_requests(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Mentor sees all pending connection requests with student profile snapshots."""
+    mentor = db.query(Mentor).filter(Mentor.user_id == current_user.id).first()
+    if not mentor:
+        raise HTTPException(status_code=403, detail="Mentor profile not found.")
+
+    pending = (
+        db.query(MentorshipRequest, User)
+        .join(User, MentorshipRequest.student_id == User.id)
+        .filter(
+            MentorshipRequest.mentor_id == mentor.id,
+            MentorshipRequest.request_type == "connection",
+            MentorshipRequest.status == "pending"
+        )
+        .order_by(MentorshipRequest.created_at.desc())
+        .all()
+    )
+
+    result = []
+    for req, student in pending:
+        result.append({
+            "request_id": req.id,
+            "student_id": student.id,
+            "student_name": student.full_name,
+            "message": req.message,
+            "created_at": req.created_at,
+            "request_type": req.request_type,
+            # Read-only snapshot — no passwords, no private fields
+            "student_snapshot": {
+                "apti_data": student.apti_data or {},
+                "personality_data": student.personality_data or {},
+                "academic_data": student.academic_data or {},
+                "aspiration_data": student.aspiration_data or {},
+            }
+        })
+    return result
+
+
+@router.get("/mentors/students/{student_id}/profile")
+def get_student_profile_for_mentor(student_id: UUID, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Mentor views a student's read-only profile (must have a connection request or accepted link)."""
+    mentor = db.query(Mentor).filter(Mentor.user_id == current_user.id).first()
+    if not mentor:
+        raise HTTPException(status_code=403, detail="Mentor profile not found.")
+
+    link = db.query(MentorshipRequest).filter(
+        MentorshipRequest.student_id == student_id,
+        MentorshipRequest.mentor_id == mentor.id,
+        MentorshipRequest.request_type == "connection",
+        MentorshipRequest.status.in_(["pending", "accepted"])
+    ).first()
+    if not link:
+        raise HTTPException(status_code=403, detail="No connection request found for this student.")
+
+    student = db.query(User).filter(User.id == student_id).first()
+    if not student:
+        raise HTTPException(status_code=404, detail="Student not found.")
+
+    return {
+        "student_id": student.id,
+        "full_name": student.full_name,
+        "apti_data": student.apti_data or {},
+        "personality_data": student.personality_data or {},
+        "academic_data": student.academic_data or {},
+        "aspiration_data": student.aspiration_data or {},
+        "lifestyle_data": student.lifestyle_data or {},
+    }
+
+
+@router.patch("/connections/{request_id}/accept")
+def accept_connection_request(request_id: UUID, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Mentor accepts a connection request — enables chat immediately."""
+    mentor = db.query(Mentor).filter(Mentor.user_id == current_user.id).first()
+    if not mentor:
+        raise HTTPException(status_code=403, detail="Mentor profile not found.")
+
+    req = db.query(MentorshipRequest).filter(
+        MentorshipRequest.id == request_id,
+        MentorshipRequest.mentor_id == mentor.id,
+        MentorshipRequest.request_type == "connection"
+    ).first()
+    if not req:
+        raise HTTPException(status_code=404, detail="Request not found.")
+    if req.status != "pending":
+        raise HTTPException(status_code=400, detail=f"Request is already '{req.status}'.")
+
+    req.status = "accepted"
+    db.commit()
+    return {"message": "Connection accepted. Chat is now enabled.", "request_id": str(req.id)}
+
+
+@router.patch("/connections/{request_id}/reject")
+def reject_connection_request(request_id: UUID, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Mentor rejects a connection request."""
+    mentor = db.query(Mentor).filter(Mentor.user_id == current_user.id).first()
+    if not mentor:
+        raise HTTPException(status_code=403, detail="Mentor profile not found.")
+
+    req = db.query(MentorshipRequest).filter(
+        MentorshipRequest.id == request_id,
+        MentorshipRequest.mentor_id == mentor.id,
+        MentorshipRequest.request_type == "connection"
+    ).first()
+    if not req:
+        raise HTTPException(status_code=404, detail="Request not found.")
+
+    req.status = "rejected"
+    db.commit()
+    return {"message": "Connection request rejected.", "request_id": str(req.id)}
