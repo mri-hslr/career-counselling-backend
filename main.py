@@ -12,10 +12,13 @@ from api.v1.aptitude import router as aptitude_router
 from api.v1.profile import router as profile_router
 from api.v1.career import router as career_router
 from api.v1.roadmap import router as roadmap_router
-from router.personality import router as personality_router
 from api.v1.mentor import router as mentor_router
 from api.v1.parent import router as parent_router
 from api.v1.chat import router as chat_router, purge_old_messages_loop
+from api.v1.reports import router as reports_router # Adjust path if needed
+# 👉 FIXED: Correctly importing the new psychometrics router
+from router.psychometrics import router as psychometrics_router 
+
 # --- NEW IMPORTS FOR DATABASE CREATION ---
 from core.database import engine, Base
 from models.users import User  # Importing this ensures SQLAlchemy knows the table exists before creating
@@ -24,10 +27,10 @@ from models.mentorship import Mentor, MentorAvailability, MentorshipRequest, Ses
 from models.compass import Profile, AcademicProfile, PsychometricProfile, LifestyleProfile, FinancialProfile, AspirationProfile
 from models.careers import Career, Skill, CareerSkill, UserSkill, StudentInsight
 from models.assessments import Test, Result
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 
 logger = logging.getLogger(__name__)
-
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -44,7 +47,6 @@ async def lifespan(app: FastAPI):
         await task
     except asyncio.CancelledError:
         pass
-
 
 app = FastAPI(
     title="Career Counseling AI API",
@@ -75,11 +77,13 @@ app.include_router(submit_router)
 app.include_router(aptitude_router)
 app.include_router(profile_router)
 app.include_router(career_router)
-app.include_router(personality_router)
 app.include_router(mentor_router)
 app.include_router(parent_router)
 app.include_router(chat_router)
 
+# 👉 FIXED: Including the updated router properly
+app.include_router(psychometrics_router)
+app.include_router(reports_router)
 @app.get("/")
 async def root():
     return {"message": "Career Counseling AI API is running."}

@@ -24,7 +24,10 @@ COLUMN_MAPPING = {
     "financial": "financial_data",
     "passion": "passion_strength_data",
     "aspiration": "aspiration_data",
-    "interests":"career_interest_data"
+    "interest":"career_interest_data",
+    "eq": "eq_data",                   # 👉 NEW
+    "orientation": "orientation_data"
+    
 }
 
 class UniversalSubmission(BaseModel):
